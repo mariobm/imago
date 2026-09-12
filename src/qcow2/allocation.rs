@@ -54,7 +54,16 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         &self,
         count: ClusterCount,
     ) -> io::Result<HostCluster> {
-        self.allocator().await?.allocate_clusters(count, None).await
+        let cluster = self
+            .allocator()
+            .await?
+            .allocate_clusters(count, None)
+            .await?;
+        // Callers publish references to metadata directly (e.g. L1 entries),
+        // bypassing the L2 cache dependency. Flush the allocation first so a
+        // process crash cannot leave a referenced cluster marked free.
+        self.caches.flush_rb().await?;
+        Ok(cluster)
     }
 
     /// Allocate one data clusters for the given guest cluster.
@@ -541,5 +550,60 @@ impl<S: Storage> Allocator<S> {
             rb_index = 0;
             rt_index += 1;
         }
+    }
+}
+
+#[cfg(all(test, feature = "async"))]
+mod crash_tests {
+    use super::*;
+    use crate::{file::File, FormatCreateBuilder, StorageOpenOptions};
+    use std::io::{Read, Seek, SeekFrom};
+
+    #[tokio::test]
+    async fn published_l2_table_has_an_on_disk_refcount() {
+        let path =
+            std::env::temp_dir().join(format!("imago-meta-crash-{}.qcow2", std::process::id()));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let opts = || StorageOpenOptions::new().filename(&path).write(true);
+        Qcow2::<File>::create_builder(File::open(opts()).await.unwrap())
+            .size(64 * 1024 * 1024)
+            .create()
+            .await
+            .unwrap();
+        let image = Qcow2::<File>::open_image(File::open(opts()).await.unwrap(), true)
+            .await
+            .unwrap();
+        image.ensure_l2(GuestOffset(0)).await.unwrap();
+        // Read the published metadata through a fresh file handle before any
+        // explicit image flush, exactly what a replacement process would see.
+        let mut disk = std::fs::File::open(&path).unwrap();
+        fn u64_at(disk: &mut std::fs::File, at: u64) -> u64 {
+            disk.seek(SeekFrom::Start(at)).unwrap();
+            let mut bytes = [0; 8];
+            disk.read_exact(&mut bytes).unwrap();
+            u64::from_be_bytes(bytes)
+        }
+        let l1_offset = u64_at(&mut disk, 40);
+        let l2_offset = u64_at(&mut disk, l1_offset) & 0x00ff_ffff_ffff_fe00;
+        let ref_table = u64_at(&mut disk, 48);
+        let ref_block = u64_at(&mut disk, ref_table);
+        disk.seek(SeekFrom::Start(ref_block + (l2_offset / 65536) * 2))
+            .unwrap();
+        let mut bytes = [0; 2];
+        disk.read_exact(&mut bytes).unwrap();
+        let count = u16::from_be_bytes(bytes);
+        image.flush().await.unwrap();
+        drop(image);
+        drop(disk);
+        std::fs::remove_file(&path).unwrap();
+        assert_ne!(l2_offset, 0);
+        assert_eq!(
+            count, 1,
+            "published L2 table must not be reusable after a crash"
+        );
     }
 }
